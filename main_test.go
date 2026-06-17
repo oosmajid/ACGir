@@ -285,6 +285,80 @@ func TestDirectMediaCommonCameraVoipFallback(t *testing.T) {
 	}
 }
 
+func TestUniqueZipName(t *testing.T) {
+	used := map[string]bool{}
+	cases := []struct{ in, want string }{
+		{"acgir-p1.mp3", "acgir-p1.mp3"},
+		{"acgir-p1.mp3", "acgir-p1-2.mp3"},
+		{"acgir-p1.mp3", "acgir-p1-3.mp3"},
+		{"acgir-p2.mp3", "acgir-p2.mp3"},
+	}
+	for _, c := range cases {
+		if got := uniqueZipName(c.in, used); got != c.want {
+			t.Fatalf("uniqueZipName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSafeOutputNameDistinguishesConnectorLinks(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://connect.example.edu/p123456/", "acgir-p123456.mp3"},
+		{"https://lms.example.ir/mod/adobeconnect/joinrecording.php?id=42&session=abc", "acgir-recording-42.mp3"},
+		{"https://lms.example.ir/mod/adobeconnect/joinrecording.php?id=7", "acgir-recording-7.mp3"},
+	}
+	for _, c := range cases {
+		if got := safeOutputName(c.in); got != c.want {
+			t.Fatalf("safeOutputName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// Two different recordings must not collide.
+	a := safeOutputName("https://lms.example.ir/mod/adobeconnect/joinrecording.php?id=42")
+	b := safeOutputName("https://lms.example.ir/mod/adobeconnect/joinrecording.php?id=43")
+	if a == b {
+		t.Fatalf("connector links with different ids collided: %q", a)
+	}
+}
+
+func TestHandleDownloadAllBundlesReadyJobs(t *testing.T) {
+	dir := t.TempDir()
+	manager := newJobManager()
+
+	add := func(id, filename string, payload []byte) {
+		p := filepath.Join(dir, id+".mp3")
+		if err := os.WriteFile(p, payload, 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		j := &job{outputPath: p, status: jobStatus{ID: id, State: "done", Filename: filename, Logs: []string{}}}
+		manager.jobs[id] = j
+	}
+	add("a", "acgir-rec.mp3", []byte("AAAA"))
+	add("b", "acgir-rec.mp3", []byte("BBBB")) // same filename -> must be deduped in the zip
+	// An unfinished job should be skipped.
+	manager.jobs["c"] = &job{status: jobStatus{ID: "c", State: "running", Logs: []string{}}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/download-all?ids=a,b,c,missing", nil)
+	rec := httptest.NewRecorder()
+	manager.handleDownloadAll(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	if len(zr.File) != 2 {
+		t.Fatalf("zip has %d files, want 2", len(zr.File))
+	}
+	names := map[string]bool{}
+	for _, f := range zr.File {
+		names[f.Name] = true
+	}
+	if !names["acgir-rec.mp3"] || !names["acgir-rec-2.mp3"] {
+		t.Fatalf("zip names = %v, want acgir-rec.mp3 and acgir-rec-2.mp3", names)
+	}
+}
+
 func buildAudioFLV(format byte, payload []byte) []byte {
 	var b bytes.Buffer
 	b.Write([]byte{'F', 'L', 'V', 0x01, 0x04})

@@ -44,6 +44,7 @@ func main() {
 	mux.HandleFunc("/api/convert", manager.handleConvert)
 	mux.HandleFunc("/api/jobs/", manager.handleJob)
 	mux.HandleFunc("/api/download/", manager.handleDownload)
+	mux.HandleFunc("/api/download-all", manager.handleDownloadAll)
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -210,6 +211,84 @@ func (m *jobManager) handleDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, j.outputPath)
 }
 
+func (m *jobManager) handleDownloadAll(w http.ResponseWriter, r *http.Request) {
+	rawIDs := r.URL.Query().Get("ids")
+	type entry struct {
+		name string
+		path string
+	}
+	var entries []entry
+	for _, id := range strings.Split(rawIDs, ",") {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		j := m.get(id)
+		if j == nil {
+			continue
+		}
+		status := j.snapshot()
+		if status.State != "done" || j.outputPath == "" {
+			continue
+		}
+		if _, err := os.Stat(j.outputPath); err != nil {
+			continue
+		}
+		name := status.Filename
+		if name == "" {
+			name = "acgir-audio.mp3"
+		}
+		entries = append(entries, entry{name: name, path: j.outputPath})
+	}
+	if len(entries) == 0 {
+		http.Error(w, "no ready files", http.StatusConflict)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": "acgir-recordings.zip"}))
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	used := map[string]bool{}
+	for _, e := range entries {
+		name := uniqueZipName(e.name, used)
+		in, err := os.Open(e.path)
+		if err != nil {
+			continue
+		}
+		out, err := zw.Create(name)
+		if err != nil {
+			in.Close()
+			return
+		}
+		_, copyErr := io.Copy(out, in)
+		in.Close()
+		if copyErr != nil {
+			return
+		}
+	}
+}
+
+func uniqueZipName(name string, used map[string]bool) string {
+	if name == "" {
+		name = "acgir-audio.mp3"
+	}
+	if !used[name] {
+		used[name] = true
+		return name
+	}
+	ext := path.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s-%d%s", stem, i, ext)
+		if !used[candidate] {
+			used[candidate] = true
+			return candidate
+		}
+	}
+}
+
 func (m *jobManager) get(id string) *job {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -343,7 +422,7 @@ func runConversion(j *job, req convertRequest) {
 	if zipPath == "" {
 		if len(discovery.RecordingBases) == 0 {
 			if discovery.LoginURL != "" {
-				j.fail(fmt.Errorf("لینک به صفحه ورود برگشت: %s. برنامه بدون Cookie نشست نمی‌تواند از Moodle/Adobe Connect عبور کند. در مرورگر وارد سامانه شوید و Cookie همان نشست را در بخش Cookie وارد کنید، یا لینک مستقیم ضبط/zip را بدهید.", discovery.LoginURL))
+				j.fail(fmt.Errorf("این ضبط خصوصیه و برای باز شدن به «کوکی ورود» نیاز داره؛ لینک به صفحهٔ ورود سامانه رسید. توی فرم، بخش «ضبط خصوصیه و باز نمی‌شه؟» رو باز کن و طبق راهنمای قدم‌به‌قدم، کوکی ورود رو وارد کن و دوباره امتحان کن. (آدرسی که به صفحهٔ ورود رسید: %s)", discovery.LoginURL))
 				return
 			}
 			if zipErr != nil {
@@ -975,7 +1054,7 @@ var (
 
 func downloadDirectMedia(client *http.Client, bases []string, cookie, workDir string, j *job) ([]string, error) {
 	if len(bases) == 0 {
-		return nil, errors.New("مسیر ضبط پیدا نشد. اگر لینک خصوصی است، کوکی نشست Adobe Connect را وارد کنید.")
+		return nil, errors.New("نتونستم محتوای این ضبط رو پیدا کنم. اگر ضبط خصوصیه، توی بخش «ضبط خصوصیه و باز نمی‌شه؟» کوکی ورود رو وارد کن و دوباره امتحان کن.")
 	}
 	mediaDir := filepath.Join(workDir, "media")
 	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
@@ -1050,7 +1129,7 @@ func downloadDirectMedia(client *http.Client, bases []string, cookie, workDir st
 		files = append(files, local)
 	}
 	if len(files) == 0 {
-		return nil, errors.New("هیچ فایل رسانه‌ای قابل دریافت نبود. اگر لینک نیاز به ورود دارد، کوکی نشست را وارد کنید.")
+		return nil, errors.New("هیچ فایل صوتی‌ای دانلود نشد. اگر این کلاس نیاز به ورود داره، توی بخش «ضبط خصوصیه و باز نمی‌شه؟» کوکی ورود رو وارد کن و دوباره امتحان کن.")
 	}
 	return files, nil
 }
@@ -1827,10 +1906,22 @@ func safeOutputName(raw string) string {
 	u, err := url.Parse(raw)
 	name := "acgir-audio"
 	if err == nil {
-		p := strings.TrimRight(u.Path, "/")
-		if p != "" {
-			name = path.Base(p)
-			name = strings.TrimSuffix(name, path.Ext(name))
+		base := strings.ToLower(path.Base(strings.TrimRight(u.Path, "/")))
+		if base == "" || strings.HasSuffix(base, ".php") {
+			// Connector/launcher links (e.g. joinrecording.php) share the same
+			// path, so derive the name from a distinguishing query parameter.
+			for _, key := range []string{"id", "sco-id", "scoId", "recordingId", "session"} {
+				if v := strings.TrimSpace(u.Query().Get(key)); v != "" {
+					name = "recording-" + v
+					break
+				}
+			}
+		} else {
+			p := strings.TrimRight(u.Path, "/")
+			if p != "" {
+				name = path.Base(p)
+				name = strings.TrimSuffix(name, path.Ext(name))
+			}
 		}
 	}
 	name = sanitizeFileName(name)
@@ -1888,336 +1979,761 @@ const indexHTML = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ACGir</title>
+  <title>ACGir — صدای کلاس را به MP3 تبدیل کن</title>
+  <meta name="theme-color" content="#0e7d92" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0f16" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='16' fill='%230e7d92'/><g fill='white'><rect x='14' y='25' width='5' height='14' rx='2.5'/><rect x='25' y='15' width='5' height='34' rx='2.5'/><rect x='36' y='28' width='5' height='8' rx='2.5'/><rect x='47' y='22' width='5' height='20' rx='2.5'/></g></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f5f7f9;
-      --panel: #ffffff;
-      --text: #14202b;
-      --muted: #5f6f80;
-      --border: #d8e0e8;
-      --accent: #1d6f86;
-      --accent-strong: #13576a;
-      --danger: #b83232;
-      --ok: #23734c;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Tahoma, Arial, sans-serif;
+      color-scheme: light dark;
+      --bg-1: #e9eff6;
+      --bg-2: #f5f8fc;
+      --surface: #ffffff;
+      --surface-soft: #f5f8fc;
+      --text: #102031;
+      --muted: #566778;
+      --faint: #8090a0;
+      --border: #e4eaf1;
+      --border-strong: #d3dde8;
+      --brand: #0e7d92;
+      --brand-strong: #0a6172;
+      --brand-tint: rgba(14, 125, 146, 0.10);
+      --on-brand: #ffffff;
+      --ring: rgba(14, 125, 146, 0.28);
+      --ok-text: #14683d;
+      --ok-bg: #e7f5ee;
+      --ok-border: #bce4cd;
+      --err-text: #a72822;
+      --err-bg: #fceceb;
+      --err-border: #f3c9c6;
+      --info-text: #1f4fd0;
+      --info-bg: #eaf1ff;
+      --info-border: #d2e0ff;
+      --shadow: 0 18px 40px -20px rgba(16, 32, 47, 0.30), 0 4px 12px -6px rgba(16, 32, 47, 0.10);
+      --shadow-sm: 0 2px 8px -4px rgba(16, 32, 47, 0.18);
+      --radius: 16px;
+      --font: "Vazirmatn", "Segoe UI", Tahoma, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-1: #090e15;
+        --bg-2: #0f1620;
+        --surface: #141d29;
+        --surface-soft: #101822;
+        --text: #e8eef5;
+        --muted: #9babbd;
+        --faint: #6e8094;
+        --border: #21303f;
+        --border-strong: #2c3d4f;
+        --brand: #25b3c6;
+        --brand-strong: #1796a9;
+        --brand-tint: rgba(37, 179, 198, 0.14);
+        --on-brand: #04222a;
+        --ring: rgba(37, 179, 198, 0.32);
+        --ok-text: #7ee3ab;
+        --ok-bg: rgba(33, 130, 80, 0.16);
+        --ok-border: rgba(33, 130, 80, 0.40);
+        --err-text: #ff9b94;
+        --err-bg: rgba(207, 59, 52, 0.16);
+        --err-border: rgba(207, 59, 52, 0.42);
+        --info-text: #9cc0ff;
+        --info-bg: rgba(37, 99, 235, 0.14);
+        --info-border: rgba(37, 99, 235, 0.38);
+        --shadow: 0 22px 48px -24px rgba(0, 0, 0, 0.70), 0 4px 14px -8px rgba(0, 0, 0, 0.50);
+        --shadow-sm: 0 2px 10px -6px rgba(0, 0, 0, 0.6);
+      }
     }
     * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
     body {
       margin: 0;
-      min-height: 100vh;
-      background: var(--bg);
+      min-height: 100dvh;
+      font-family: var(--font);
+      font-size: 16px;
+      line-height: 1.7;
       color: var(--text);
+      background:
+        radial-gradient(1100px 520px at 85% -8%, var(--brand-tint), transparent 60%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-2));
+      background-attachment: fixed;
     }
-    main {
-      width: min(920px, calc(100vw - 32px));
+    .app {
+      width: min(700px, calc(100vw - 32px));
       margin: 0 auto;
-      padding: 40px 0;
+      padding: 28px 0 56px;
     }
-    header {
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 18px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 28px;
-      letter-spacing: 0;
-    }
-    .version {
-      color: var(--muted);
-      font-size: 13px;
-      white-space: nowrap;
-    }
-    section {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 18px;
-      box-shadow: 0 10px 24px rgba(20, 32, 43, 0.06);
-    }
-    form {
-      display: grid;
-      gap: 14px;
-    }
-    label {
-      display: grid;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    input, textarea {
-      width: 100%;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px 13px;
-      font: inherit;
-      color: var(--text);
-      background: #fff;
-      outline: none;
-      direction: ltr;
-      text-align: left;
-    }
-    textarea {
-      min-height: 86px;
-      resize: vertical;
-    }
-    input:focus, textarea:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(29, 111, 134, 0.12);
-    }
-    details {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 11px 13px;
-      background: #fbfcfd;
-    }
-    summary {
-      cursor: pointer;
-      color: var(--text);
-      font-size: 14px;
-      user-select: none;
-    }
-    details label {
-      margin-top: 12px;
-    }
-    .row {
+
+    /* Header */
+    .hero {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 22px;
+    }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .logo {
+      flex: none;
+      width: 52px;
+      height: 52px;
+      border-radius: 15px;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: linear-gradient(150deg, #15a7bd, var(--brand-strong));
+      box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255,255,255,0.18);
+    }
+    .logo svg { width: 28px; height: 28px; }
+    .brand h1 { margin: 0; font-size: 25px; font-weight: 700; letter-spacing: -0.2px; }
+    .brand p { margin: 3px 0 0; color: var(--muted); font-size: 13.5px; line-height: 1.6; max-width: 42ch; }
+    .pill {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--brand-strong);
+      background: var(--brand-tint);
+      border: 1px solid color-mix(in srgb, var(--brand) 22%, transparent);
+      padding: 6px 12px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    .pill svg { width: 14px; height: 14px; }
+
+    /* Panel + form */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+      box-shadow: var(--shadow);
+    }
+    form { display: grid; gap: 18px; }
+    .field { display: grid; gap: 9px; }
+    .field > label { font-size: 14.5px; font-weight: 600; color: var(--text); }
+    textarea, input {
+      width: 100%;
+      font: inherit;
+      color: var(--text);
+      background: var(--surface-soft);
+      border: 1.5px solid var(--border-strong);
+      border-radius: 12px;
+      padding: 13px 14px;
+      outline: none;
+      transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+    }
+    #urls { min-height: 104px; resize: vertical; direction: ltr; text-align: left; line-height: 1.9; }
+    #cookie { min-height: 78px; resize: vertical; direction: ltr; text-align: left; font-size: 13px; }
+    textarea::placeholder { color: var(--faint); }
+    textarea:focus, input:focus {
+      border-color: var(--brand);
+      background: var(--surface);
+      box-shadow: 0 0 0 4px var(--ring);
+    }
+    .field-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
       flex-wrap: wrap;
     }
-    button, a.button {
+    .hint { color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+    .counter { color: var(--brand-strong); font-size: 12.5px; font-weight: 700; white-space: nowrap; }
+    .counter:empty { display: none; }
+
+    /* Disclosure (cookie guide) */
+    .disclosure {
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: var(--surface-soft);
+      overflow: hidden;
+    }
+    .disclosure > summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 13px 15px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+      user-select: none;
+    }
+    .disclosure > summary::-webkit-details-marker { display: none; }
+    .summary-ico {
+      flex: none; width: 30px; height: 30px; border-radius: 9px;
+      display: grid; place-items: center;
+      color: var(--brand-strong); background: var(--brand-tint);
+    }
+    .summary-ico svg { width: 16px; height: 16px; }
+    .summary-txt { flex: 1 1 auto; }
+    .summary-txt small { display: block; font-weight: 400; font-size: 12px; color: var(--muted); margin-top: 1px; }
+    .chev { flex: none; width: 18px; height: 18px; color: var(--faint); transition: transform 200ms ease; }
+    .disclosure[open] .chev { transform: rotate(180deg); }
+    .disclosure-body { padding: 4px 15px 16px; border-top: 1px solid var(--border); display: grid; gap: 13px; }
+    .lead { margin: 12px 0 2px; font-size: 13.5px; color: var(--muted); line-height: 1.8; }
+    .lead b { color: var(--text); }
+    .steps { margin: 0; padding: 0; list-style: none; display: grid; gap: 11px; counter-reset: s; }
+    .steps li {
+      position: relative;
+      padding-inline-start: 40px;
+      min-height: 28px;
+      font-size: 13.5px;
+      line-height: 1.85;
+      color: var(--text);
+      counter-increment: s;
+    }
+    .steps li::before {
+      content: counter(s);
+      position: absolute;
+      inset-inline-start: 0;
+      top: 1px;
+      width: 27px;
+      height: 27px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--on-brand);
+      background: linear-gradient(150deg, #15a7bd, var(--brand-strong));
+    }
+    .steps kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-bottom-width: 2px;
+      border-radius: 6px;
+      padding: 1px 6px;
+      color: var(--text);
+      direction: ltr;
+      display: inline-block;
+    }
+    .cookie-label { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 2px; }
+    .privacy {
+      margin: 0;
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      font-size: 12.5px;
+      line-height: 1.75;
+      color: var(--info-text);
+      background: var(--info-bg);
+      border: 1px solid var(--info-border);
+      border-radius: 11px;
+      padding: 11px 13px;
+    }
+    .privacy svg { flex: none; width: 17px; height: 17px; margin-top: 2px; }
+
+    /* Actions */
+    .actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .actions .note { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.7; flex: 1 1 200px; }
+    .btn {
       appearance: none;
       border: 0;
-      border-radius: 8px;
-      background: var(--accent);
-      color: white;
-      min-height: 44px;
-      padding: 0 18px;
+      cursor: pointer;
       font: inherit;
       font-weight: 700;
-      cursor: pointer;
-      text-decoration: none;
+      border-radius: 12px;
+      min-height: 48px;
+      padding: 0 22px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
+      gap: 9px;
+      text-decoration: none;
+      color: var(--on-brand);
+      background: linear-gradient(150deg, #13a0b5, var(--brand-strong));
+      box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255,255,255,0.16);
+      transition: transform 120ms ease, filter 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
     }
-    button:hover, a.button:hover {
-      background: var(--accent-strong);
+    .btn svg { width: 19px; height: 19px; }
+    .btn:hover { filter: brightness(1.06); }
+    .btn:active { transform: translateY(1px); }
+    .btn:focus-visible { outline: none; box-shadow: 0 0 0 4px var(--ring); }
+    .btn:disabled { cursor: progress; opacity: 0.6; filter: saturate(0.7); }
+    .btn-ghost {
+      color: var(--brand-strong);
+      background: var(--surface);
+      border: 1.5px solid var(--border-strong);
+      box-shadow: none;
+      min-height: 42px;
+      font-size: 14px;
+      padding: 0 16px;
     }
-    button:disabled {
-      cursor: wait;
-      opacity: 0.65;
-    }
-    .note {
-      color: var(--muted);
-      font-size: 13px;
+    .btn-ghost:hover { filter: none; background: var(--surface-soft); border-color: var(--brand); }
+    .btn-sm { min-height: 38px; padding: 0 15px; font-size: 13.5px; border-radius: 10px; }
+
+    /* Alerts */
+    .alert {
+      font-size: 13.5px;
       line-height: 1.8;
-      margin: 0;
-    }
-    .status {
-      margin-top: 16px;
-      display: none;
-      gap: 12px;
-    }
-    .status.visible {
-      display: grid;
-    }
-    .bar {
-      width: 100%;
-      height: 10px;
-      border-radius: 999px;
-      overflow: hidden;
-      background: #e8edf2;
-    }
-    .fill {
-      height: 100%;
-      width: 0%;
-      background: var(--accent);
-      transition: width 180ms ease;
-    }
-    .step {
-      color: var(--text);
-      font-weight: 700;
-      min-height: 24px;
-    }
-    .error {
-      display: none;
-      color: var(--danger);
-      border: 1px solid rgba(184, 50, 50, 0.25);
-      background: rgba(184, 50, 50, 0.06);
-      border-radius: 8px;
-      padding: 12px;
-      line-height: 1.8;
+      border-radius: 12px;
+      padding: 12px 14px;
       white-space: pre-wrap;
     }
-    .error.visible {
-      display: block;
-    }
-    .done {
-      display: none;
-    }
-    .done.visible {
+    .alert[hidden] { display: none; }
+    .alert-error { color: var(--err-text); background: var(--err-bg); border: 1px solid var(--err-border); }
+    .panel > .alert-error { margin-top: 16px; }
+
+    /* Results */
+    .results { display: none; margin-top: 18px; }
+    .results.visible { display: block; }
+    .toolbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
       flex-wrap: wrap;
-      border: 1px solid rgba(35, 115, 76, 0.28);
-      background: rgba(35, 115, 76, 0.07);
-      border-radius: 8px;
-      padding: 12px;
+      margin-bottom: 12px;
+      padding: 0 4px;
     }
-    .done strong {
-      color: var(--ok);
-    }
-    pre {
-      margin: 0;
-      max-height: 260px;
-      overflow: auto;
-      direction: rtl;
-      text-align: right;
-      white-space: pre-wrap;
+    .summary { color: var(--muted); font-size: 13.5px; font-weight: 600; }
+    #cards { display: grid; gap: 12px; }
+
+    /* Card */
+    .card {
+      background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 8px;
-      background: #fbfcfd;
-      color: #34495a;
-      padding: 12px;
-      font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      border-inline-start: 4px solid var(--border-strong);
+      border-radius: 13px;
+      padding: 15px 16px;
+      box-shadow: var(--shadow-sm);
+      display: grid;
+      gap: 12px;
+      transition: border-color 160ms ease;
     }
-    @media (max-width: 640px) {
-      main { width: min(100vw - 22px, 920px); padding: 22px 0; }
-      header { align-items: flex-start; flex-direction: column; gap: 6px; }
-      section { padding: 14px; }
-      button, a.button { width: 100%; }
-      .row { align-items: stretch; }
+    .card[data-state="running"] { border-inline-start-color: var(--brand); }
+    .card[data-state="done"] { border-inline-start-color: var(--ok-text); }
+    .card[data-state="error"] { border-inline-start-color: var(--err-text); }
+    .card-top { display: flex; align-items: center; gap: 11px; }
+    .idx {
+      flex: none;
+      width: 26px; height: 26px;
+      border-radius: 8px;
+      display: grid; place-items: center;
+      font-size: 12.5px; font-weight: 700;
+      color: var(--muted);
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+    }
+    .card-meta { flex: 1 1 auto; min-width: 0; display: grid; gap: 1px; }
+    .link {
+      direction: ltr; text-align: left;
+      font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--muted);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .step { font-size: 13px; font-weight: 600; color: var(--text); min-height: 18px; }
+    .badge {
+      flex: none;
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 12.5px; font-weight: 700;
+      padding: 5px 11px;
+      border-radius: 999px;
+      white-space: nowrap;
+      color: var(--muted);
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+    }
+    .badge svg { width: 14px; height: 14px; }
+    .card[data-state="running"] .badge { color: var(--brand-strong); background: var(--brand-tint); border-color: transparent; }
+    .card[data-state="done"] .badge { color: var(--ok-text); background: var(--ok-bg); border-color: var(--ok-border); }
+    .card[data-state="error"] .badge { color: var(--err-text); background: var(--err-bg); border-color: var(--err-border); }
+    .bar { width: 100%; height: 8px; border-radius: 999px; background: var(--surface-soft); border: 1px solid var(--border); overflow: hidden; }
+    .fill {
+      height: 100%; width: 0%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #15a7bd, var(--brand));
+      transition: width 280ms ease;
+    }
+    .card[data-state="done"] .fill { background: linear-gradient(90deg, #1fa86a, var(--ok-text)); }
+    .card[data-state="running"] .fill {
+      background-image: linear-gradient(90deg, #15a7bd, var(--brand)), linear-gradient(110deg, transparent 30%, rgba(255,255,255,0.45) 50%, transparent 70%);
+      background-size: 100% 100%, 220px 100%;
+      background-repeat: no-repeat, no-repeat;
+      animation: shimmer 1.25s linear infinite;
+    }
+    @keyframes shimmer { from { background-position: 0 0, -220px 0; } to { background-position: 0 0, calc(100% + 220px) 0; } }
+    .card-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .download[hidden] { display: none; }
+    .logwrap { margin-inline-start: auto; }
+    .logwrap > summary {
+      list-style: none; cursor: pointer; user-select: none;
+      font-size: 12.5px; color: var(--faint); font-weight: 600;
+    }
+    .logwrap > summary::-webkit-details-marker { display: none; }
+    .logwrap > summary:hover { color: var(--muted); }
+    .logs {
+      margin: 10px 0 0;
+      max-height: 190px; overflow: auto;
+      direction: rtl; text-align: right; white-space: pre-wrap;
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 12px;
+      color: var(--muted);
+      font: 11.5px/1.75 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .card .alert-error { margin: 0; }
+
+    /* Empty state */
+    .empty {
+      margin-top: 18px;
+      text-align: center;
+      padding: 34px 20px;
+      border: 1.5px dashed var(--border-strong);
+      border-radius: var(--radius);
+      color: var(--muted);
+    }
+    .empty[hidden] { display: none; }
+    .empty .art { width: 64px; height: 64px; margin: 0 auto 12px; color: var(--brand); opacity: 0.85; }
+    .empty h3 { margin: 0 0 5px; font-size: 15.5px; font-weight: 700; color: var(--text); }
+    .empty p { margin: 0 auto; font-size: 13px; max-width: 40ch; line-height: 1.8; }
+
+    /* Footer */
+    .foot {
+      margin-top: 22px;
+      text-align: center;
+      font-size: 12.5px;
+      color: var(--faint);
+      display: flex; align-items: center; justify-content: center; gap: 7px;
+    }
+    .foot svg { width: 14px; height: 14px; }
+
+    .spin { animation: spin 0.9s linear infinite; transform-origin: center; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    @media (max-width: 600px) {
+      .app { width: calc(100vw - 24px); padding: 18px 0 40px; }
+      .hero { gap: 12px; }
+      .panel { padding: 17px; }
+      .btn { width: 100%; }
+      .actions .note { flex-basis: 100%; }
+      .toolbar .btn-ghost { width: 100%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
     }
   </style>
 </head>
 <body>
-  <main>
-    <header>
-      <h1>ACGir</h1>
-      <div class="version">Adobe Connect Audio Extractor</div>
+  <div class="app">
+    <header class="hero">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><rect x="2.5" y="9" width="3" height="6" rx="1.5"/><rect x="7.5" y="5" width="3" height="14" rx="1.5"/><rect x="12.5" y="10.5" width="3" height="3" rx="1.5"/><rect x="17.5" y="7" width="3" height="10" rx="1.5"/></svg>
+        </div>
+        <div class="brand-text">
+          <h1>ACGir</h1>
+          <p>صدای کلاس‌های ضبط‌شدهٔ ادوبی‌کانکت رو در چند ثانیه به فایل MP3 تبدیل کن.</p>
+        </div>
+      </div>
+      <span class="pill">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+        روی کامپیوتر خودت اجرا می‌شه
+      </span>
     </header>
 
-    <section>
-      <form id="form">
-        <label>
-          لینک ضبط Adobe Connect
-          <input id="url" type="url" placeholder="https://server.example.com/p123456/" required autocomplete="off">
-        </label>
+    <main>
+      <section class="panel">
+        <form id="form" novalidate>
+          <div class="field">
+            <label for="urls">لینک کلاس‌هایی که می‌خوای صداشون رو داشته باشی</label>
+            <textarea id="urls" autocomplete="off" spellcheck="false" placeholder="https://example.edu/p123456/&#10;https://example.edu/p789012/"></textarea>
+            <div class="field-foot">
+              <span class="hint">هر خط یک لینک. می‌تونی یکی بذاری یا چند تا با هم — برای هر کدوم یک فایل جدا می‌گیری.</span>
+              <span id="counter" class="counter"></span>
+            </div>
+          </div>
 
-        <details>
-          <summary>نشست خصوصی / Cookie</summary>
-          <label>
-            Cookie اختیاری
-            <textarea id="cookie" placeholder="BREEZESESSION=...; other=value"></textarea>
-          </label>
-        </details>
+          <details class="disclosure">
+            <summary>
+              <span class="summary-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              </span>
+              <span class="summary-txt">
+                ضبط خصوصیه و باز نمی‌شه؟
+                <small>اگر برنامه گفت لینک به «صفحهٔ ورود» می‌ره، اینجا رو باز کن</small>
+              </span>
+              <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            </summary>
+            <div class="disclosure-body">
+              <p class="lead"><b>بیشتر ضبط‌ها بدون این مرحله کار می‌کنن.</b> فقط اگر دیدی باز نمی‌شه و برنامه گفت به صفحهٔ ورود می‌رسه، این چند قدم ساده رو برو تا «کوکی ورود» رو پیدا کنی:</p>
+              <ol class="steps">
+                <li>توی همین مرورگر، اول وارد سامانهٔ دانشگاه یا کلاست شو — همون‌جایی که معمولاً ضبط‌ها رو می‌بینی.</li>
+                <li>صفحهٔ همون ضبط رو باز کن، بعد کلید <kbd>F12</kbd> رو بزن (یا کلیک راست → «Inspect / بازرسی»).</li>
+                <li>بالای پنجره‌ای که باز شد، تب <kbd>Network</kbd> رو انتخاب کن و یک‌بار صفحه رو رفرش کن (<kbd>F5</kbd>).</li>
+                <li>روی اولین ردیف لیست کلیک کن و پایین، توی بخش «Request Headers»، دنبال خطی بگرد که با <kbd>Cookie:</kbd> شروع می‌شه.</li>
+                <li>تمام متن جلوی Cookie رو کپی کن و توی کادر پایین بچسبون. (بخشی که با <kbd>BREEZESESSION</kbd> شروع می‌شه از همه مهم‌تره.)</li>
+              </ol>
+              <label class="cookie-label" for="cookie">متن کوکی رو اینجا بچسبون</label>
+              <textarea id="cookie" autocomplete="off" spellcheck="false" placeholder="BREEZESESSION=...; نام=مقدار؛ ..."></textarea>
+              <p class="privacy">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+                <span>خیالت راحت: این کوکی فقط روی همین کامپیوتر و فقط برای همین دانلود استفاده می‌شه. هیچ‌جا ذخیره یا ارسال نمی‌شه و با بستن برنامه پاک می‌شه.</span>
+              </p>
+            </div>
+          </details>
 
-        <div class="row">
-          <p class="note">فقط برای ضبط‌هایی استفاده کنید که اجازه دسترسی و دریافت آن‌ها را دارید. اگر سرور ورود بخواهد، Cookie همان نشست را وارد کنید.</p>
-          <button id="submit" type="submit">ساخت MP3</button>
+          <div class="actions">
+            <p class="note">فقط ضبط‌هایی رو دانلود کن که اجازهٔ دسترسی بهشون رو داری.</p>
+            <button id="submit" class="btn" type="submit">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="2.5" y="9" width="3" height="6" rx="1.5"/><rect x="7.5" y="5" width="3" height="14" rx="1.5"/><rect x="12.5" y="10.5" width="3" height="3" rx="1.5"/><rect x="17.5" y="7" width="3" height="10" rx="1.5"/></svg>
+              تبدیل به MP3
+            </button>
+          </div>
+        </form>
+
+        <div id="formError" class="alert alert-error" role="alert" hidden></div>
+      </section>
+
+      <section id="results" class="results" aria-live="polite">
+        <div class="toolbar">
+          <span id="summary" class="summary"></span>
+          <a id="downloadAll" class="btn btn-ghost" href="#" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            دریافت همه در یک فایل zip
+          </a>
         </div>
-      </form>
+        <div id="cards"></div>
+      </section>
 
-      <div id="status" class="status">
-        <div class="bar"><div id="fill" class="fill"></div></div>
-        <div id="step" class="step"></div>
-        <div id="done" class="done">
-          <strong>فایل آماده است.</strong>
-          <a id="download" class="button" href="#">دریافت MP3</a>
-        </div>
-        <div id="error" class="error"></div>
-        <pre id="logs"></pre>
+      <div id="empty" class="empty">
+        <svg class="art" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="12" x2="3" y2="14"/><line x1="6.5" y1="9" x2="6.5" y2="17"/><line x1="10" y1="5" x2="10" y2="21"/><line x1="13.5" y1="8" x2="13.5" y2="18"/><line x1="17" y1="10" x2="17" y2="15"/><line x1="20.5" y1="11" x2="20.5" y2="13"/></svg>
+        <h3>هنوز لینکی اضافه نکردی</h3>
+        <p>لینک کلاس‌ها رو بالا بذار و دکمهٔ «تبدیل به MP3» رو بزن تا فایل‌ها همین‌جا، یکی‌یکی، آماده بشن.</p>
       </div>
-    </section>
-  </main>
+
+      <p class="foot">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        این برنامه روی کامپیوتر خودت اجرا می‌شه و فقط برای دانلود ضبط به سرور کلاست وصل می‌شه.
+      </p>
+    </main>
+  </div>
 
   <script>
-    const form = document.getElementById('form');
-    const urlInput = document.getElementById('url');
-    const cookieInput = document.getElementById('cookie');
-    const submit = document.getElementById('submit');
-    const statusBox = document.getElementById('status');
-    const fill = document.getElementById('fill');
-    const step = document.getElementById('step');
-    const logs = document.getElementById('logs');
-    const errorBox = document.getElementById('error');
-    const doneBox = document.getElementById('done');
-    const download = document.getElementById('download');
-    let pollTimer = null;
+    var MAX_CONCURRENT = 3;
+    var POLL_MS = 1000;
+    function $(id) { return document.getElementById(id); }
 
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      clearInterval(pollTimer);
-      submit.disabled = true;
-      errorBox.classList.remove('visible');
-      doneBox.classList.remove('visible');
-      logs.textContent = '';
-      step.textContent = 'شروع';
-      fill.style.width = '0%';
-      statusBox.classList.add('visible');
+    var form = $('form'), urlsInput = $('urls'), cookieInput = $('cookie'),
+        submit = $('submit'), formError = $('formError'), results = $('results'),
+        cardsBox = $('cards'), summary = $('summary'), downloadAll = $('downloadAll'),
+        counter = $('counter'), empty = $('empty');
 
-      try {
-        const res = await fetch('/api/convert', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: urlInput.value.trim(), cookie: cookieInput.value.trim() })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'درخواست پذیرفته نشد.');
-        render(data);
-        pollTimer = setInterval(() => poll(data.id), 900);
-      } catch (err) {
-        showError(err.message);
-        submit.disabled = false;
+    var jobs = [], pollTimer = null;
+
+    var ICONS = {
+      queued: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg>',
+      running: '<svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.55"/></svg>',
+      done: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+      error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="13"/><line x1="12" y1="16.5" x2="12.01" y2="16.5"/></svg>'
+    };
+    var DLICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+    var LABELS = { queued: 'در صف', running: 'در حال پردازش', done: 'آماده', error: 'مشکل پیش اومد' };
+
+    function toFa(n) {
+      return String(n).replace(/[0-9]/g, function (d) { return '۰۱۲۳۴۵۶۷۸۹'.charAt(+d); });
+    }
+
+    function parseURLs(text) {
+      var seen = {}, out = [];
+      var lines = text.split(/\r?\n/);
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (!line || !/^https?:\/\//i.test(line) || seen[line]) continue;
+        seen[line] = true;
+        out.push(line);
       }
+      return out;
+    }
+
+    function updateCounter() {
+      var n = parseURLs(urlsInput.value).length;
+      counter.textContent = n ? (toFa(n) + (n === 1 ? ' لینک' : ' لینک')) : '';
+    }
+    urlsInput.addEventListener('input', updateCounter);
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      formError.hidden = true;
+
+      var urls = parseURLs(urlsInput.value);
+      if (urls.length === 0) {
+        formError.textContent = 'یک لینک معتبر بذار که با http یا https شروع بشه. مثلاً: https://example.edu/p123456/';
+        formError.hidden = false;
+        return;
+      }
+
+      if (pollTimer) clearInterval(pollTimer);
+      cardsBox.textContent = '';
+      empty.hidden = true;
+      jobs = urls.map(function (url, i) { return createJob(url, i + 1); });
+      results.classList.add('visible');
+      submit.disabled = true;
+
+      pump();
+      updateToolbar();
+      pollTimer = setInterval(pollAll, POLL_MS);
     });
 
-    async function poll(id) {
-      try {
-        const res = await fetch('/api/jobs/' + encodeURIComponent(id));
-        const data = await res.json();
-        if (!res.ok) throw new Error('وضعیت کار خوانده نشد.');
-        render(data);
-        if (data.state === 'done' || data.state === 'error') {
-          clearInterval(pollTimer);
-          submit.disabled = false;
+    function createJob(url, idx) {
+      var card = document.createElement('article');
+      card.className = 'card';
+      card.innerHTML =
+        '<div class="card-top">' +
+          '<span class="idx"></span>' +
+          '<div class="card-meta"><span class="link" dir="ltr" title=""></span><span class="step"></span></div>' +
+          '<span class="badge"></span>' +
+        '</div>' +
+        '<div class="bar"><div class="fill"></div></div>' +
+        '<div class="card-actions">' +
+          '<a class="download btn btn-sm" href="#" hidden></a>' +
+          '<details class="logwrap"><summary>جزئیات</summary><pre class="logs"></pre></details>' +
+        '</div>' +
+        '<div class="error alert alert-error" hidden></div>';
+      card.querySelector('.idx').textContent = toFa(idx);
+      var linkEl = card.querySelector('.link');
+      linkEl.textContent = url;
+      linkEl.title = url;
+      cardsBox.appendChild(card);
+
+      var job = {
+        url: url, idx: idx, id: null, state: 'idle',
+        el: {
+          card: card,
+          badge: card.querySelector('.badge'),
+          fill: card.querySelector('.fill'),
+          step: card.querySelector('.step'),
+          download: card.querySelector('.download'),
+          error: card.querySelector('.error'),
+          logs: card.querySelector('.logs')
         }
-      } catch (err) {
-        clearInterval(pollTimer);
-        submit.disabled = false;
-        showError(err.message);
+      };
+      applyState(job, 'queued', 'برای شروع در نوبت است');
+      return job;
+    }
+
+    function applyState(job, kind, stepText) {
+      job.el.card.dataset.state = kind;
+      job.el.badge.innerHTML = ICONS[kind] + '<span>' + LABELS[kind] + '</span>';
+      if (typeof stepText === 'string') job.el.step.textContent = stepText;
+    }
+
+    function pump() {
+      var active = jobs.filter(function (j) { return j.state === 'starting' || j.state === 'running'; }).length;
+      var slots = MAX_CONCURRENT - active;
+      for (var i = 0; i < jobs.length && slots > 0; i++) {
+        if (jobs[i].state === 'idle') { startJob(jobs[i]); slots--; }
       }
     }
 
-    function render(data) {
-      fill.style.width = Math.round((data.progress || 0) * 100) + '%';
-      step.textContent = data.step || '';
-      logs.textContent = (data.logs || []).join('\n');
-      logs.scrollTop = logs.scrollHeight;
-      if (data.state === 'error') {
-        showError(data.error || 'خطای ناشناخته');
-      }
+    function startJob(job) {
+      job.state = 'starting';
+      applyState(job, 'running', 'در حال شروع…');
+      fetch('/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: job.url, cookie: cookieInput.value.trim() })
+      }).then(function (res) {
+        return res.json().then(function (data) {
+          if (!res.ok) throw new Error(data.error || 'درخواست پذیرفته نشد.');
+          job.id = data.id;
+          job.state = 'running';
+          render(job, data);
+        });
+      }).catch(function (err) {
+        job.state = 'error';
+        renderError(job, err.message);
+        pump(); updateToolbar(); checkAllDone();
+      });
+    }
+
+    function pollAll() {
+      var running = jobs.filter(function (j) { return j.state === 'running' && j.id; });
+      Promise.all(running.map(function (job) {
+        return fetch('/api/jobs/' + encodeURIComponent(job.id))
+          .then(function (res) {
+            return res.json().then(function (data) {
+              if (!res.ok) throw new Error('وضعیت کار خوانده نشد.');
+              render(job, data);
+            });
+          })
+          .catch(function (err) { job.state = 'error'; renderError(job, err.message); });
+      })).then(function () {
+        pump(); updateToolbar(); checkAllDone();
+      });
+    }
+
+    function render(job, data) {
+      job.el.fill.style.width = Math.round((data.progress || 0) * 100) + '%';
+      job.el.logs.textContent = (data.logs || []).join('\n');
+      job.el.logs.scrollTop = job.el.logs.scrollHeight;
+
       if (data.state === 'done') {
-        errorBox.classList.remove('visible');
-        doneBox.classList.add('visible');
-        download.href = data.downloadUrl;
-        download.download = data.filename || 'acgir-audio.mp3';
+        job.state = 'done';
+        job.el.fill.style.width = '100%';
+        applyState(job, 'done', 'فایل MP3 آماده‌ست');
+        job.el.error.hidden = true;
+        job.el.download.hidden = false;
+        job.el.download.href = data.downloadUrl;
+        job.el.download.download = data.filename || 'acgir-audio.mp3';
+        job.el.download.innerHTML = DLICON + '<span>دریافت ' + (data.filename || 'MP3') + '</span>';
+      } else if (data.state === 'error') {
+        job.state = 'error';
+        renderError(job, data.error || 'خطای ناشناخته');
+      } else {
+        applyState(job, 'running', data.step || 'در حال پردازش…');
       }
     }
 
-    function showError(message) {
-      errorBox.textContent = message;
-      errorBox.classList.add('visible');
+    function renderError(job, message) {
+      applyState(job, 'error', '');
+      job.el.step.textContent = '';
+      job.el.error.textContent = message;
+      job.el.error.hidden = false;
+    }
+
+    function updateToolbar() {
+      var done = jobs.filter(function (j) { return j.state === 'done'; });
+      var errored = jobs.filter(function (j) { return j.state === 'error'; }).length;
+      var pending = jobs.length - done.length - errored;
+      var parts = [toFa(jobs.length) + ' لینک'];
+      if (done.length) parts.push(toFa(done.length) + ' آماده');
+      if (pending > 0) parts.push(toFa(pending) + ' در حال انجام');
+      if (errored) parts.push(toFa(errored) + ' خطا');
+      summary.textContent = parts.join('  ·  ');
+
+      if (done.length > 1) {
+        downloadAll.hidden = false;
+        downloadAll.href = '/api/download-all?ids=' + done.map(function (j) { return encodeURIComponent(j.id); }).join(',');
+      } else {
+        downloadAll.hidden = true;
+      }
+    }
+
+    function checkAllDone() {
+      var going = jobs.some(function (j) { return j.state === 'idle' || j.state === 'starting' || j.state === 'running'; });
+      if (!going) {
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = null;
+        submit.disabled = false;
+      }
     }
   </script>
 </body>
