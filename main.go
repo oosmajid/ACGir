@@ -39,12 +39,15 @@ func main() {
 	flag.Parse()
 
 	manager := newJobManager()
+	installer := newFFmpegInstaller()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndex)
 	mux.HandleFunc("/api/convert", manager.handleConvert)
 	mux.HandleFunc("/api/jobs/", manager.handleJob)
 	mux.HandleFunc("/api/download/", manager.handleDownload)
 	mux.HandleFunc("/api/download-all", manager.handleDownloadAll)
+	mux.HandleFunc("/api/ffmpeg/status", installer.handleStatus)
+	mux.HandleFunc("/api/ffmpeg/install", installer.handleInstall)
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -1368,6 +1371,9 @@ func findFFmpeg() (string, bool) {
 			}
 		}
 	}
+	if p := managedFFmpegPath(); isExecutableFile(p) {
+		return p, true
+	}
 	if p, err := exec.LookPath("ffmpeg"); err == nil && p != "" {
 		return p, true
 	}
@@ -1383,6 +1389,398 @@ func isExecutableFile(path string) bool {
 		return true
 	}
 	return info.Mode()&0o111 != 0
+}
+
+// ---------------------------------------------------------------------------
+// Optional FFmpeg auto-install
+//
+// The app works without FFmpeg (limited to MP3/FLV-MP3). When FFmpeg is missing
+// and the platform is supported, the user can opt in to download the latest
+// static build into the app's cache dir. findFFmpeg() then picks it up
+// automatically on the next conversion.
+// ---------------------------------------------------------------------------
+
+func ffmpegInstallDir() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "acgir", "ffmpeg")
+}
+
+func managedFFmpegPath() string {
+	name := "ffmpeg"
+	if runtime.GOOS == "windows" {
+		name = "ffmpeg.exe"
+	}
+	return filepath.Join(ffmpegInstallDir(), name)
+}
+
+// ffmpegAutoInstallSupported reports whether we have a known download source
+// for the current OS/arch.
+func ffmpegAutoInstallSupported() bool {
+	switch runtime.GOOS {
+	case "windows":
+		return runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"
+	case "darwin":
+		return true // evermeet x86_64 build (runs natively on Intel, via Rosetta on Apple Silicon)
+	default:
+		return false
+	}
+}
+
+func ffmpegVersion(path string) string {
+	cmd := exec.Command(path, "-version")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
+	// Typical: "ffmpeg version 8.1.2 Copyright ..." -> keep the version token.
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		if f == "version" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return clip(line, 60)
+}
+
+type ffmpegInstallStatus struct {
+	State    string  `json:"state"` // idle | downloading | extracting | verifying | done | error
+	Step     string  `json:"step"`
+	Progress float64 `json:"progress"`
+	Version  string  `json:"version,omitempty"`
+	Error    string  `json:"error,omitempty"`
+}
+
+type ffmpegInstaller struct {
+	mu      sync.Mutex
+	status  ffmpegInstallStatus
+	running bool
+}
+
+func newFFmpegInstaller() *ffmpegInstaller {
+	return &ffmpegInstaller{status: ffmpegInstallStatus{State: "idle", Step: ""}}
+}
+
+func (fi *ffmpegInstaller) snapshot() ffmpegInstallStatus {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	return fi.status
+}
+
+func (fi *ffmpegInstaller) set(state, step string, progress float64) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	if state != "" {
+		fi.status.State = state
+	}
+	fi.status.Step = step
+	if progress >= 0 {
+		if progress > 1 {
+			progress = 1
+		}
+		fi.status.Progress = progress
+	}
+}
+
+type ffmpegStatusResponse struct {
+	Available  bool                `json:"available"`
+	Source     string              `json:"source,omitempty"` // system | managed
+	Path       string              `json:"path,omitempty"`
+	Version    string              `json:"version,omitempty"`
+	Supported  bool                `json:"supported"`
+	Installing bool                `json:"installing"`
+	Install    ffmpegInstallStatus `json:"install"`
+}
+
+func (fi *ffmpegInstaller) handleStatus(w http.ResponseWriter, r *http.Request) {
+	resp := ffmpegStatusResponse{
+		Supported: ffmpegAutoInstallSupported(),
+		Install:   fi.snapshot(),
+	}
+	fi.mu.Lock()
+	resp.Installing = fi.running
+	fi.mu.Unlock()
+
+	if path, ok := findFFmpeg(); ok {
+		resp.Available = true
+		resp.Path = path
+		if path == managedFFmpegPath() {
+			resp.Source = "managed"
+		} else {
+			resp.Source = "system"
+		}
+		resp.Version = ffmpegVersion(path)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (fi *ffmpegInstaller) handleInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !ffmpegAutoInstallSupported() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "نصب خودکار FFmpeg روی این سیستم‌عامل پشتیبانی نمی‌شود."})
+		return
+	}
+	if _, ok := findFFmpeg(); ok {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "already-installed"})
+		return
+	}
+
+	fi.mu.Lock()
+	if fi.running {
+		fi.mu.Unlock()
+		writeJSON(w, http.StatusAccepted, fi.snapshot())
+		return
+	}
+	fi.running = true
+	fi.status = ffmpegInstallStatus{State: "downloading", Step: "آماده‌سازی دانلود", Progress: 0}
+	fi.mu.Unlock()
+
+	go fi.run()
+	writeJSON(w, http.StatusAccepted, fi.snapshot())
+}
+
+func (fi *ffmpegInstaller) run() {
+	defer func() {
+		fi.mu.Lock()
+		fi.running = false
+		fi.mu.Unlock()
+		if p := recover(); p != nil {
+			fi.set("error", "", -1)
+			fi.mu.Lock()
+			fi.status.Error = fmt.Sprintf("خطای داخلی هنگام نصب: %v", p)
+			fi.mu.Unlock()
+		}
+	}()
+
+	if err := installFFmpeg(fi); err != nil {
+		fi.set("error", "", -1)
+		fi.mu.Lock()
+		fi.status.Error = err.Error()
+		fi.mu.Unlock()
+		return
+	}
+
+	path := managedFFmpegPath()
+	version := ffmpegVersion(path)
+	fi.mu.Lock()
+	fi.status.State = "done"
+	fi.status.Step = "FFmpeg با موفقیت نصب شد"
+	fi.status.Progress = 1
+	fi.status.Version = version
+	fi.mu.Unlock()
+}
+
+// resolveFFmpegSource returns the download URL and (best-effort) total size in
+// bytes for the current platform.
+func resolveFFmpegSource(client *http.Client) (string, int64, error) {
+	switch runtime.GOOS {
+	case "windows":
+		asset := "ffmpeg-master-latest-win64-gpl.zip"
+		if runtime.GOARCH == "arm64" {
+			asset = "ffmpeg-master-latest-winarm64-gpl.zip"
+		}
+		return "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/" + asset, 0, nil
+	case "darwin":
+		// evermeet.cx publishes the latest stable static macOS build.
+		body, err := getSmall(client, "https://evermeet.cx/ffmpeg/info/ffmpeg/release", "", 256<<10)
+		if err != nil {
+			return "", 0, fmt.Errorf("اطلاعات نسخهٔ FFmpeg دریافت نشد: %w", err)
+		}
+		var info struct {
+			Download struct {
+				Zip struct {
+					URL  string `json:"url"`
+					Size int64  `json:"size"`
+				} `json:"zip"`
+			} `json:"download"`
+		}
+		if err := json.Unmarshal([]byte(body), &info); err != nil || info.Download.Zip.URL == "" {
+			return "", 0, errors.New("آدرس دانلود FFmpeg برای مک پیدا نشد")
+		}
+		return info.Download.Zip.URL, info.Download.Zip.Size, nil
+	default:
+		return "", 0, errors.New("نصب خودکار روی این سیستم‌عامل پشتیبانی نمی‌شود")
+	}
+}
+
+func installFFmpeg(fi *ffmpegInstaller) error {
+	client := &http.Client{
+		Timeout: 0,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			ResponseHeaderTimeout: 45 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
+	}
+
+	fi.set("downloading", "پیدا کردن آخرین نسخهٔ FFmpeg", 0.02)
+	srcURL, totalSize, err := resolveFFmpegSource(client)
+	if err != nil {
+		return err
+	}
+
+	dir := ffmpegInstallDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("ساخت پوشهٔ نصب ممکن نشد: %w", err)
+	}
+	zipPath := filepath.Join(dir, "ffmpeg-download.zip")
+	defer os.Remove(zipPath)
+
+	fi.set("downloading", "دانلود FFmpeg", 0.05)
+	if err := downloadWithProgress(client, srcURL, zipPath, totalSize, func(written, total int64) {
+		p := 0.05
+		if total > 0 {
+			p = 0.05 + 0.75*(float64(written)/float64(total))
+		}
+		step := fmt.Sprintf("دانلود FFmpeg (%s)", humanBytes(written))
+		if total > 0 {
+			step = fmt.Sprintf("دانلود FFmpeg (%s از %s)", humanBytes(written), humanBytes(total))
+		}
+		fi.set("downloading", step, p)
+	}); err != nil {
+		return fmt.Errorf("دانلود FFmpeg ناموفق بود: %w", err)
+	}
+
+	fi.set("extracting", "استخراج فایل اجرایی", 0.85)
+	dest := managedFFmpegPath()
+	if err := extractFFmpegBinary(zipPath, dest); err != nil {
+		return fmt.Errorf("استخراج FFmpeg ناموفق بود: %w", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(dest, 0o755); err != nil {
+			return fmt.Errorf("تنظیم دسترسی اجرا ممکن نشد: %w", err)
+		}
+		// Strip the quarantine attribute on macOS so Gatekeeper allows running it.
+		if runtime.GOOS == "darwin" {
+			_ = exec.Command("xattr", "-d", "com.apple.quarantine", dest).Run()
+		}
+	}
+
+	fi.set("verifying", "بررسی نصب", 0.95)
+	if v := ffmpegVersion(dest); v == "" {
+		hint := ""
+		if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+			hint = " اگر روی مک Apple Silicon هستید، ممکن است نیاز به نصب Rosetta داشته باشید (در ترمینال: softwareupdate --install-rosetta)."
+		}
+		return errors.New("FFmpeg دانلود شد اما اجرا نشد." + hint)
+	}
+	return nil
+}
+
+func downloadWithProgress(client *http.Client, raw, dest string, knownTotal int64, onProgress func(written, total int64)) error {
+	req, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "ACGir/1.0 (+local Adobe Connect audio extractor)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %s", resp.Status)
+	}
+
+	total := knownTotal
+	if total <= 0 && resp.ContentLength > 0 {
+		total = resp.ContentLength
+	}
+
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	buf := make([]byte, 256*1024)
+	var written int64
+	lastUpdate := time.Time{}
+	for {
+		nr, er := resp.Body.Read(buf)
+		if nr > 0 {
+			if _, ew := out.Write(buf[:nr]); ew != nil {
+				return ew
+			}
+			written += int64(nr)
+			if onProgress != nil && time.Since(lastUpdate) > 250*time.Millisecond {
+				onProgress(written, total)
+				lastUpdate = time.Now()
+			}
+		}
+		if er != nil {
+			if errors.Is(er, io.EOF) {
+				break
+			}
+			return er
+		}
+	}
+	if onProgress != nil {
+		onProgress(written, total)
+	}
+	return nil
+}
+
+// extractFFmpegBinary finds the ffmpeg executable inside a downloaded zip and
+// writes it to dest.
+func extractFFmpegBinary(zipPath, dest string) error {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	wantWindows := runtime.GOOS == "windows"
+	var selected *zip.File
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		base := strings.ToLower(path.Base(f.Name))
+		if wantWindows {
+			if base == "ffmpeg.exe" {
+				selected = f
+				break
+			}
+		} else if base == "ffmpeg" {
+			selected = f
+			break
+		}
+	}
+	if selected == nil {
+		return errors.New("فایل اجرایی ffmpeg در آرشیو دانلودشده پیدا نشد")
+	}
+
+	in, err := selected.Open()
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dest + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func convertLargestZipMediaWithFFmpeg(zipPath, workDir, output, ffmpegPath string, j *job) (extractResult, error) {
@@ -2266,6 +2664,7 @@ const indexHTML = `<!doctype html>
     .btn:active { transform: translateY(1px); }
     .btn:focus-visible { outline: none; box-shadow: 0 0 0 4px var(--ring); }
     .btn:disabled { cursor: progress; opacity: 0.6; filter: saturate(0.7); }
+    .btn[hidden] { display: none; }
     .btn-ghost {
       color: var(--brand-strong);
       background: var(--surface);
@@ -2277,6 +2676,36 @@ const indexHTML = `<!doctype html>
     }
     .btn-ghost:hover { filter: none; background: var(--surface-soft); border-color: var(--brand); }
     .btn-sm { min-height: 38px; padding: 0 15px; font-size: 13.5px; border-radius: 10px; }
+
+    /* FFmpeg status */
+    .ffmpeg {
+      margin-top: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      padding: 14px 16px;
+      box-shadow: var(--shadow-sm);
+      display: grid;
+      gap: 12px;
+    }
+    .ffmpeg[hidden] { display: none; }
+    .ffmpeg[data-tone="ok"] { border-color: var(--ok-border); background: var(--ok-bg); }
+    .ffmpeg[data-tone="warn"] { border-color: var(--info-border); background: var(--info-bg); }
+    .ffmpeg-head { display: flex; align-items: center; gap: 12px; }
+    .ffmpeg-ico {
+      flex: none; width: 34px; height: 34px; border-radius: 10px;
+      display: grid; place-items: center;
+      color: var(--brand-strong); background: var(--brand-tint);
+    }
+    .ffmpeg[data-tone="ok"] .ffmpeg-ico { color: var(--ok-text); background: var(--ok-bg); }
+    .ffmpeg[data-tone="warn"] .ffmpeg-ico { color: var(--info-text); background: transparent; }
+    .ffmpeg-ico svg { width: 18px; height: 18px; }
+    .ffmpeg-txt { flex: 1 1 auto; min-width: 0; display: grid; gap: 2px; }
+    .ffmpeg-txt strong { font-size: 14px; font-weight: 700; color: var(--text); }
+    .ffmpeg-txt small { font-size: 12.5px; color: var(--muted); line-height: 1.7; }
+    .ffmpeg #ffmpegInstall { flex: none; }
+    .ffmpeg .bar[hidden] { display: none; }
+    .ffmpeg .alert-error { margin: 0; }
 
     /* Alerts */
     .alert {
@@ -2500,6 +2929,21 @@ const indexHTML = `<!doctype html>
         </form>
 
         <div id="formError" class="alert alert-error" role="alert" hidden></div>
+      </section>
+
+      <section id="ffmpegBox" class="ffmpeg" hidden aria-live="polite">
+        <div class="ffmpeg-head">
+          <span class="ffmpeg-ico" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 0 12"/><path d="m8 11 4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          </span>
+          <div class="ffmpeg-txt">
+            <strong id="ffmpegTitle"></strong>
+            <small id="ffmpegDesc"></small>
+          </div>
+          <button id="ffmpegInstall" class="btn btn-ghost btn-sm" type="button" hidden>دانلود و نصب FFmpeg</button>
+        </div>
+        <div id="ffmpegProg" class="bar" hidden><div id="ffmpegFill" class="fill"></div></div>
+        <div id="ffmpegErr" class="alert alert-error" hidden></div>
       </section>
 
       <section id="results" class="results" aria-live="polite">
@@ -2735,6 +3179,79 @@ const indexHTML = `<!doctype html>
         submit.disabled = false;
       }
     }
+
+    // ---- FFmpeg status / optional auto-install ----
+    var ffBox = $('ffmpegBox'), ffTitle = $('ffmpegTitle'), ffDesc = $('ffmpegDesc'),
+        ffInstall = $('ffmpegInstall'), ffProg = $('ffmpegProg'), ffFill = $('ffmpegFill'),
+        ffErr = $('ffmpegErr');
+    var ffTimer = null;
+
+    function renderFfmpeg(s) {
+      ffBox.hidden = false;
+      ffErr.hidden = true;
+      var inst = s.install || {};
+      var busy = s.installing || inst.state === 'downloading' || inst.state === 'extracting' || inst.state === 'verifying';
+
+      if (busy) {
+        ffBox.dataset.tone = 'warn';
+        ffInstall.hidden = true;
+        ffProg.hidden = false;
+        ffFill.style.width = Math.round((inst.progress || 0) * 100) + '%';
+        ffTitle.textContent = 'در حال نصب FFmpeg…';
+        ffDesc.textContent = inst.step || 'لطفاً صبر کن، این کار ممکنه چند لحظه طول بکشه.';
+        return;
+      }
+      ffProg.hidden = true;
+
+      if (s.available) {
+        ffBox.dataset.tone = 'ok';
+        ffInstall.hidden = true;
+        ffTitle.textContent = 'کیفیت کامل فعاله ✓';
+        var src = s.source === 'managed' ? 'نصب‌شده توسط برنامه' : 'روی سیستم نصب';
+        ffDesc.textContent = 'FFmpeg ' + src + ' است' + (s.version ? ' (نسخهٔ ' + s.version + ')' : '') + '؛ همهٔ کدک‌ها پشتیبانی می‌شن.';
+        return;
+      }
+
+      // Not available
+      ffBox.dataset.tone = 'warn';
+      ffTitle.textContent = 'FFmpeg نصب نیست (اختیاری)';
+      if (inst.state === 'error') {
+        ffErr.textContent = inst.error || 'نصب ناموفق بود.';
+        ffErr.hidden = false;
+      }
+      if (s.supported) {
+        ffDesc.textContent = 'برنامه بدون FFmpeg هم کار می‌کنه، ولی فقط MP3/FLV ساده. برای پشتیبانی کامل (AAC/Speex/…) می‌تونی آخرین نسخه رو همین‌جا با یک کلیک دانلود و نصب کنی.';
+        ffInstall.hidden = false;
+        ffInstall.disabled = false;
+        ffInstall.textContent = inst.state === 'error' ? 'تلاش دوباره' : 'دانلود و نصب FFmpeg';
+      } else {
+        ffInstall.hidden = true;
+        ffDesc.textContent = 'برنامه بدون FFmpeg کار می‌کنه (MP3/FLV ساده). برای پشتیبانی کامل، FFmpeg رو دستی نصب کن و کنار برنامه یا روی PATH بذار.';
+      }
+    }
+
+    function refreshFfmpeg() {
+      fetch('/api/ffmpeg/status').then(function (r) { return r.json(); })
+        .then(function (s) {
+          renderFfmpeg(s);
+          var inst = s.install || {};
+          var busy = s.installing || inst.state === 'downloading' || inst.state === 'extracting' || inst.state === 'verifying';
+          if (busy && !ffTimer) ffTimer = setInterval(refreshFfmpeg, 1000);
+          if (!busy && ffTimer) { clearInterval(ffTimer); ffTimer = null; }
+        })
+        .catch(function () { ffBox.hidden = true; });
+    }
+
+    ffInstall.addEventListener('click', function () {
+      ffInstall.disabled = true;
+      ffErr.hidden = true;
+      fetch('/api/ffmpeg/install', { method: 'POST' })
+        .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || 'نصب شروع نشد.'); }); })
+        .then(function () { refreshFfmpeg(); if (!ffTimer) ffTimer = setInterval(refreshFfmpeg, 1000); })
+        .catch(function (err) { ffInstall.disabled = false; ffErr.textContent = err.message; ffErr.hidden = false; });
+    });
+
+    refreshFfmpeg();
   </script>
 </body>
 </html>`

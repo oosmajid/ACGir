@@ -12,7 +12,10 @@ go test ./...
 echo "==> building binaries"
 CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o dist/ACGir-macos-arm64 .
 CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/ACGir-macos-amd64 .
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/ACGir-windows-amd64.exe .
+# Windows: single self-contained executable. Double-clicking it opens a console
+# window (keep it open to keep the app running, close it to stop) and opens the
+# browser on its own — no separate launcher needed.
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/ACGir-Windows.exe .
 
 echo "==> writing launchers"
 
@@ -35,16 +38,18 @@ exec "$BIN"
 LAUNCHER
 chmod +x "dist/Start-ACGir-macOS.command"
 
-# Windows: double-click runs the .exe (it opens the browser itself).
-cat > "dist/Start-ACGir-Windows.bat" <<'LAUNCHER'
-@echo off
-cd /d "%~dp0"
-echo ACGir is running and will open in your browser.
-echo Keep this window open; close it (or press Ctrl+C) to stop the app.
-echo.
-ACGir-windows-amd64.exe
-pause
-LAUNCHER
+echo "==> packaging"
+# Clean up artifacts from older builds.
+rm -rf dist/_mac dist/ACGir-macOS.zip dist/ACGir-Windows.zip \
+       dist/ACGir-windows-amd64.exe dist/Start-ACGir-Windows.bat
+
+# macOS bundle: both binaries (Intel + Apple Silicon) + double-click launcher,
+# because a single macOS file can't cover both architectures.
+mkdir -p dist/_mac
+cp dist/ACGir-macos-arm64 dist/ACGir-macos-amd64 dist/Start-ACGir-macOS.command dist/_mac/
+( cd dist/_mac && zip -q -r ../ACGir-macOS.zip . )
+rm -rf dist/_mac
+# Windows ships as a single self-contained ACGir-Windows.exe (no zip needed).
 
 echo "==> done"
 ls -la dist/
